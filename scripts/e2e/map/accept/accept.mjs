@@ -4,14 +4,12 @@ import { appendFileSync, writeFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
 export const ACCEPT_LABEL = "accept-behaviour-change"
-export const REPORT_BOT = "github-actions[bot]"
 export const ROWS_SCHEMA_VERSION = "1.0"
 export const ROWS_SECTION = "App map"
 export const ACCEPT_GROUP_ID = "accept"
 
 const SHA = /^[0-9a-f]{40}$/
 const HASH = /^[0-9a-f]{64}$/
-const MARKER = /<!-- e2e-accept-binding head=([0-9a-f]{40}) diff=([0-9a-f]{64}) -->/g
 const WRITE_PERMISSIONS = new Set(["admin", "maintain", "write"])
 
 export function reportedDiffHash(changes) {
@@ -20,25 +18,6 @@ export function reportedDiffHash(changes) {
     if (lines[i] === lines[i - 1]) throw new Error(`duplicate reported change ${lines[i].split("\u0000")[0]}`)
   }
   return createHash("sha256").update(lines.join("\n")).digest("hex")
-}
-
-export function bindingMarker({ headSha, diffHash }) {
-  if (!SHA.test(headSha)) throw new Error(`bad head sha "${headSha}"`)
-  if (!HASH.test(diffHash)) throw new Error(`bad diff hash "${diffHash}"`)
-  return `<!-- e2e-accept-binding head=${headSha} diff=${diffHash} -->`
-}
-
-export function latestBinding(comments) {
-  let best = null
-  for (const c of comments) {
-    if (c.user?.login !== REPORT_BOT || c.user?.type !== "Bot") continue
-    const found = [...String(c.body ?? "").matchAll(MARKER)].at(-1)
-    if (!found) continue
-    const at = Date.parse(c.updated_at ?? c.created_at)
-    if (best && at < best.at) continue
-    best = { at, headSha: found[1], diffHash: found[2] }
-  }
-  return best && { headSha: best.headSha, diffHash: best.diffHash }
 }
 
 export function lastLabelEvent(timeline, label = ACCEPT_LABEL) {
@@ -53,21 +32,42 @@ export function hasWriteAccess(permission) {
   return WRITE_PERMISSIONS.has(permission?.role_name) || WRITE_PERMISSIONS.has(permission?.permission)
 }
 
-export function evaluateLabel({ pr, labelEvent, permission, binding }) {
-  const head = pr.head.sha
-  if (!pr.labels.some((l) => l.name === ACCEPT_LABEL) || !labelEvent) return { state: "absent", headSha: head }
+function labelRefusal({ labelEvent, prAuthor, labelActorPermission }) {
   const actor = labelEvent.actor
-  if (!actor || actor === pr.user.login) return { state: "refused", reason: "author", actor, headSha: head }
-  if (!hasWriteAccess(permission)) return { state: "refused", reason: "no-write", actor, headSha: head }
-  if (!binding) return { state: "refused", reason: "no-report", actor, headSha: head }
-  if (binding.headSha !== head) return { state: "refused", reason: "stale-report", actor, headSha: head, reportedHead: binding.headSha }
-  return { state: "accepted", actor, headSha: head, diffHash: binding.diffHash }
+  if (!actor || actor === prAuthor) return { reason: "author", actor }
+  if (!hasWriteAccess(labelActorPermission)) return { reason: "no-write", actor }
+  return null
 }
 
-export function rebind({ accepted, headSha, diffHash }) {
-  if (!accepted) return { action: "none" }
-  if (accepted.diffHash === diffHash) return { action: "keep", headSha, diffHash }
-  return { action: "remove", headSha, diffHash, previousDiffHash: accepted.diffHash }
+export function evaluateAccept({ timeline, prAuthor, labelActorPermission, priorOutcome, headSha, diffHash }) {
+  if (!SHA.test(headSha ?? "")) throw new Error(`bad head sha "${headSha}"`)
+  if (!HASH.test(diffHash ?? "")) throw new Error(`bad diff hash "${diffHash}"`)
+  if (typeof prAuthor !== "string" || prAuthor === "") throw new Error("prAuthor is required")
+  const labelEvent = lastLabelEvent(timeline)
+  if (!labelEvent) return { state: "absent", headSha }
+  const refused = labelRefusal({ labelEvent, prAuthor, labelActorPermission })
+  if (refused) return { state: "refused", ...refused, headSha, removeLabel: true }
+  const actor = labelEvent.actor
+  if (!priorOutcome) return { state: "refused", reason: "no-report", actor, headSha, removeLabel: true }
+  const reportedAt = Date.parse(priorOutcome.reportedAt ?? "")
+  if (!SHA.test(priorOutcome.head ?? "") || !HASH.test(priorOutcome.reportedDiffHash ?? "") || Number.isNaN(reportedAt)) {
+    throw new Error("priorOutcome must carry head (full sha), reportedDiffHash (sha256) and reportedAt (ISO time)")
+  }
+  if (priorOutcome.reportedDiffHash !== diffHash) {
+    return { state: "refused", reason: "diff-changed", actor, headSha, reportedHead: priorOutcome.head, previousDiffHash: priorOutcome.reportedDiffHash, diffHash, removeLabel: true }
+  }
+  const labelledAt = Date.parse(labelEvent.at ?? "")
+  if (Number.isNaN(labelledAt) || labelledAt <= reportedAt) {
+    return { state: "refused", reason: "label-before-report", actor, headSha, reportedAt: priorOutcome.reportedAt, removeLabel: true }
+  }
+  return { state: "accepted", actor, headSha, diffHash, reportedHead: priorOutcome.head }
+}
+
+export function nextOutcome({ priorOutcome, headSha, diffHash, now }) {
+  if (!SHA.test(headSha ?? "")) throw new Error(`bad head sha "${headSha}"`)
+  if (!HASH.test(diffHash ?? "")) throw new Error(`bad diff hash "${diffHash}"`)
+  const carried = priorOutcome && priorOutcome.reportedDiffHash === diffHash && !Number.isNaN(Date.parse(priorOutcome.reportedAt ?? ""))
+  return { head: headSha, reportedDiffHash: diffHash, reportedAt: carried ? priorOutcome.reportedAt : new Date(now).toISOString() }
 }
 
 export function neutraliseMentions(text) {
@@ -89,22 +89,23 @@ const REASONS = {
   author: (e) => `it was added by ${e.actor ?? "an unknown user"}, the author of this pull request. Another person with write access has to add it.`,
   "no-write": (e) => `${e.actor} does not have write access to this repository.`,
   "no-report": () => "no behaviour or screen change has been reported for this pull request yet, so there is nothing to accept.",
-  "stale-report": (e) => `the reported changes are for ${e.reportedHead.slice(0, 7)}, not for the current head ${e.headSha.slice(0, 7)}. Add the label again once the new report is posted.`,
+  "diff-changed": () => "the reported changes differ from the ones it accepted. Add it again to accept the changes below.",
+  "label-before-report": () => "it was added before the current changes were reported. Add it again to accept the changes below.",
 }
 
 export function refusalText(evaluation) {
   return `Removed ${ACCEPT_LABEL}: ${REASONS[evaluation.reason](evaluation)}`
 }
 
-export function refusalComment(evaluation) {
-  return `${escapeMarkdown(refusalText(evaluation))}\n\n<!-- e2e-accept-refusal -->`
+export function advisoryComment(evaluation) {
+  return escapeMarkdown(`${ACCEPT_LABEL} will not count: ${REASONS[evaluation.reason](evaluation)} The next report applies this rule; this comment changes nothing.`)
 }
 
-export function acceptGroup({ evaluation, changes, decision = { action: "none" } }) {
+export function acceptGroup({ evaluation, changes }) {
   const ids = changes.map((c) => c.id)
   const rows = []
-  if (decision.action === "remove") {
-    rows.push({ text: `${ACCEPT_LABEL} was removed: the reported changes differ from the ones it accepted. Add it again to accept the changes below.`, level: "fail", ids: [] })
+  if (evaluation.state === "refused" && evaluation.reason === "diff-changed") {
+    rows.push({ text: `${ACCEPT_LABEL} was removed: ${REASONS["diff-changed"](evaluation)}`, level: "fail", ids: [] })
   } else if (evaluation.state === "accepted") {
     rows.push({ text: `Accepted by ${evaluation.actor} for head ${evaluation.headSha.slice(0, 7)}.`, level: "info", ids: [] })
   } else if (evaluation.state === "refused") {
@@ -113,7 +114,7 @@ export function acceptGroup({ evaluation, changes, decision = { action: "none" }
   if (changes.length === 0) {
     rows.push({ text: "No behaviour or screen change reported.", level: "info", ids: [] })
   } else {
-    const accepted = evaluation.state === "accepted" && decision.action !== "remove"
+    const accepted = evaluation.state === "accepted"
     for (const c of changes) rows.push({ text: c.text, level: accepted ? "info" : "fail", ids: [c.id] })
     if (!accepted) {
       rows.push({ text: `Add the label ${ACCEPT_LABEL} (someone other than the author, with write access) to accept all of these.`, level: "warn", ids })
@@ -169,18 +170,12 @@ export function makeClient({ repo, token, fetch: fetchImpl = globalThis.fetch, a
   return {
     getPull: (n) => json(`pulls/${n}`),
     timeline: (n) => paged(`issues/${n}/timeline`),
-    comments: (n) => paged(`issues/${n}/comments`),
     async permission(login) {
       const path = `collaborators/${encodeURIComponent(login)}/permission`
       const res = await call("GET", path)
       if (res.status === 404) return { permission: "none", role_name: "none" }
       if (!res.ok) throw Object.assign(new Error(`GitHub ${res.status} for ${path}`), { status: res.status })
       return res.json()
-    },
-    async removeLabel(n) {
-      const path = `issues/${n}/labels/${encodeURIComponent(ACCEPT_LABEL)}`
-      const res = await call("DELETE", path)
-      if (!res.ok && res.status !== 404) throw Object.assign(new Error(`GitHub ${res.status} for ${path}`), { status: res.status })
     },
     async comment(n, body) {
       const res = await call("POST", `issues/${n}/comments`, { body })
@@ -189,32 +184,31 @@ export function makeClient({ repo, token, fetch: fetchImpl = globalThis.fetch, a
   }
 }
 
-export async function checkLabel({ client, prNumber, eventSha = "", log = console.log }) {
+export async function adviseLabel({ client, prNumber, eventSha = "", log = console.log }) {
   if (!/^[1-9][0-9]{0,9}$/.test(String(prNumber))) throw new Error(`bad pull request number "${prNumber}"`)
   const pr = await client.getPull(prNumber)
   if (eventSha && eventSha !== pr.head.sha) log(`event sha ${eventSha} is not the head; using head ${pr.head.sha}`)
   const labelEvent = lastLabelEvent(await client.timeline(prNumber))
-  const permission = labelEvent?.actor ? await client.permission(labelEvent.actor) : null
-  const binding = latestBinding(await client.comments(prNumber))
-  const evaluation = evaluateLabel({ pr, labelEvent, permission, binding })
-  if (evaluation.state === "refused") {
-    try {
-      await client.removeLabel(prNumber)
-      await client.comment(prNumber, refusalComment(evaluation))
-      evaluation.removed = true
-    } catch (e) {
-      if (e.status !== 403) throw e
-      evaluation.removed = false
-      log("token cannot write to this pull request (fork); the report applies the same rule")
-    }
+  if (!labelEvent || !pr.labels.some((l) => l.name === ACCEPT_LABEL)) return { state: "absent", headSha: pr.head.sha, commented: false }
+  const permission = labelEvent.actor ? await client.permission(labelEvent.actor) : null
+  const refused = labelRefusal({ labelEvent, prAuthor: pr.user.login, labelActorPermission: permission })
+  if (!refused) return { state: "pending-report", actor: labelEvent.actor, headSha: pr.head.sha, commented: false }
+  const advice = { state: "will-not-count", ...refused, headSha: pr.head.sha }
+  try {
+    await client.comment(prNumber, advisoryComment(advice))
+    advice.commented = true
+  } catch (e) {
+    if (e.status !== 403) throw e
+    advice.commented = false
+    log("token cannot write to this pull request (fork); the report applies the same rule")
   }
-  return evaluation
+  return advice
 }
 
 function summaryLine(e) {
   if (e.state === "absent") return `\`${ACCEPT_LABEL}\` is not on the pull request (head ${e.headSha}).`
-  if (e.state === "accepted") return `\`${ACCEPT_LABEL}\` added by ${escapeMarkdown(e.actor)} counts for head ${e.headSha}, diff ${e.diffHash}.`
-  return `${escapeMarkdown(refusalText(e))} (head ${e.headSha}, removed: ${e.removed})`
+  if (e.state === "pending-report") return `\`${ACCEPT_LABEL}\` added by ${escapeMarkdown(e.actor)}; the next report decides whether it counts for head ${e.headSha}.`
+  return `${advisoryComment(e)} (head ${e.headSha}, commented: ${e.commented})`
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
@@ -224,7 +218,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     return 2
   }
   const client = makeClient({ repo: env.GITHUB_REPOSITORY, token: env.GITHUB_TOKEN, apiUrl: env.GITHUB_API_URL })
-  const evaluation = await checkLabel({ client, prNumber: env.PR_NUMBER, eventSha: env.EVENT_SHA })
+  const evaluation = await adviseLabel({ client, prNumber: env.PR_NUMBER, eventSha: env.EVENT_SHA })
   console.log(JSON.stringify(evaluation))
   if (out) writeFileSync(out, JSON.stringify(evaluation, null, 2) + "\n")
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, summaryLine(evaluation) + "\n")
