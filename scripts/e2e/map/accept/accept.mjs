@@ -100,10 +100,10 @@ export function refusalComment(evaluation) {
   return `${escapeMarkdown(refusalText(evaluation))}\n\n<!-- e2e-accept-refusal -->`
 }
 
-export function acceptGroup({ evaluation, changes, decision }) {
+export function acceptGroup({ evaluation, changes, decision = { action: "none" } }) {
   const ids = changes.map((c) => c.id)
   const rows = []
-  if (decision?.action === "remove") {
+  if (decision.action === "remove") {
     rows.push({ text: `${ACCEPT_LABEL} was removed: the reported changes differ from the ones it accepted. Add it again to accept the changes below.`, level: "fail", ids: [] })
   } else if (evaluation.state === "accepted") {
     rows.push({ text: `Accepted by ${evaluation.actor} for head ${evaluation.headSha.slice(0, 7)}.`, level: "info", ids: [] })
@@ -113,7 +113,7 @@ export function acceptGroup({ evaluation, changes, decision }) {
   if (changes.length === 0) {
     rows.push({ text: "No behaviour or screen change reported.", level: "info", ids: [] })
   } else {
-    const accepted = evaluation.state === "accepted" && decision?.action !== "remove"
+    const accepted = evaluation.state === "accepted" && decision.action !== "remove"
     for (const c of changes) rows.push({ text: c.text, level: accepted ? "info" : "fail", ids: [c.id] })
     if (!accepted) {
       rows.push({ text: `Add the label ${ACCEPT_LABEL} (someone other than the author, with write access) to accept all of these.`, level: "warn", ids })
@@ -122,6 +122,7 @@ export function acceptGroup({ evaluation, changes, decision }) {
   return { id: ACCEPT_GROUP_ID, title: "Behaviour and screen changes", rows }
 }
 
+/** @param {{ setupRunId: string | number, groups: ReturnType<typeof acceptGroup>[], error?: string | null }} args */
 export function commentRowsT3({ setupRunId, groups, error = null }) {
   return {
     schema_version: ROWS_SCHEMA_VERSION,
@@ -188,7 +189,7 @@ export function makeClient({ repo, token, fetch: fetchImpl = globalThis.fetch, a
   }
 }
 
-export async function checkLabel({ client, prNumber, eventSha, log = console.log }) {
+export async function checkLabel({ client, prNumber, eventSha = "", log = console.log }) {
   if (!/^[1-9][0-9]{0,9}$/.test(String(prNumber))) throw new Error(`bad pull request number "${prNumber}"`)
   const pr = await client.getPull(prNumber)
   if (eventSha && eventSha !== pr.head.sha) log(`event sha ${eventSha} is not the head; using head ${pr.head.sha}`)
