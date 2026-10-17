@@ -22,7 +22,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Check who added the label and what it is bound to
+      - name: Advise whether the label can count (the report decides)
         run: node scripts/e2e/map/accept/accept.mjs check accept-result.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
