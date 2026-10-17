@@ -1,0 +1,30 @@
+name: e2e-accept
+
+on:
+  pull_request:
+    types: [labeled]
+permissions:
+  pull-requests: write
+  contents: read
+jobs:
+  accept:
+    if: github.event.label.name == 'accept-behaviour-change'
+    concurrency:
+      group: e2e-accept-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/e2e/map/accept
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Check who added the label and what it is bound to
+        run: node scripts/e2e/map/accept/accept.mjs check accept-result.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_SHA: ${{ github.event.pull_request.head.sha }}

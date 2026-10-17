@@ -1,0 +1,23 @@
+name: scratch-helper
+on:
+  workflow_dispatch:
+    inputs:
+      action: {type: choice, options: [open-pr, report], required: true}
+      branch: {type: string, required: false}
+      pr: {type: string, required: false}
+      diff: {type: string, required: false}
+permissions:
+  pull-requests: write
+  contents: read
+jobs:
+  helper:
+    runs-on: ubuntu-latest
+    steps:
+      - if: inputs.action == 'open-pr'
+        env: {GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", BRANCH: "${{ inputs.branch }}"}
+        run: gh pr create -R "$GITHUB_REPOSITORY" --head "$BRANCH" --base main --title "bot PR $BRANCH" --body "opened by GITHUB_TOKEN"
+      - if: inputs.action == 'report'
+        env: {GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", PR: "${{ inputs.pr }}", DIFF: "${{ inputs.diff }}"}
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" -q .head.sha)
+          gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="stub report for $head <!-- e2e-accept-binding head=$head diff=$DIFF -->"
